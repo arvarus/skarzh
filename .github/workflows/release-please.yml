@@ -1,0 +1,27 @@
+name: Release
+
+# Keeps a release pull request open on main: version bump in package.json, src-tauri/Cargo.toml,
+# src-tauri/Cargo.lock and src-tauri/tauri.conf.json, plus CHANGELOG.md, built from the
+# Conventional Commits merged since the last release. Merging it tags the release and creates the
+# GitHub release (no installer is built or attached yet). Requires the RELEASE_PLEASE_TOKEN
+# secret: a fine-grained token on this repository with read and write access to Contents and
+# Pull requests. Events from GITHUB_TOKEN don't trigger workflows, so with it the required checks
+# wouldn't run on the release pull request without a manual approval.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    name: release-please
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
