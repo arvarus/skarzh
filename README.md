@@ -44,6 +44,103 @@ This produces the executable at `src-tauri/target/release/skarzh.exe` without ge
 | `npm run verify:rust`  | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` |
 | `npm run verify`       | `verify:front` then `verify:rust`: run it before every commit                     |
 
+## Session
+
+skarzh works on one session at a time. A session is the user's setup (input folders, output folder, path template) plus everything the application derives from it (scan results, thumbnail cache, perceptual hashes, later review decisions). At each launch the user continues the previous session or starts a new one: a new session deletes all the application data of the previous one. The input and output folders belong to the user: the session logic never modifies or deletes anything in them (it only creates the output folder when it is missing).
+
+The code lives in `src-tauri/src/session/` (plain Rust, unit-tested on temporary directories); the commands in `src-tauri/src/lib.rs` are thin wrappers around it.
+
+### Storage
+
+Everything is under the application local data directory (`%LOCALAPPDATA%\com.arvarus.skarzh`):
+
+```text
+session/
+  session.json   schemaVersion, config, createdAt, updatedAt (RFC 3339 UTC); written atomically
+  thumbnails/    reserved for the thumbnail cache
+  cache/         reserved for hashes, scan data, review decisions...
+```
+
+`session.json` is written to a temporary file in the same directory, flushed, then renamed over the target, so a crash never leaves a partial file. A file that is corrupted, or written by a newer schema version, is reported as `unreadable` and never overwritten: the only way out is a reset. Resuming changes nothing on disk. All data derived from a session must live under `session/`, so that a reset wipes it.
+
+A reset deletes `session/` recursively. It refuses (`reset_unsafe`, nothing touched) unless the directory is exactly `<app data>/session`, is not a filesystem root, and neither contains nor lies inside any configured input or output folder. Links (symlinks, junctions) are never followed: a link found inside is removed itself, its target is left alone. Backend jobs added later (scan, thumbnails, hashing) must be cancelled before `session_reset`.
+
+### Commands
+
+On failure every command returns an error `{ "code": string, "message": string }`; switch on `code`.
+
+| Command                                | Result                                                                                            |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `session_status()`                     | `{ state: "none" }`, `{ state: "existing", summary }` or `{ state: "unreadable", reason }`        |
+| `session_create({ config })`           | the created `Session`; `session_already_exists` when anything (even unreadable) is already there  |
+| `session_get()` / `session_resume()`   | the saved `Session` (`no_session`, `session_corrupted`, `session_schema_too_new`...)              |
+| `session_reset()`                      | nothing; idempotent (no session is not an error)                                                  |
+| `validate_path_template({ template })` | the template normalised to `/` separators                                                         |
+| `preview_path_template({ template })`  | the template rendered with a fixed sample: 2024-07-14, `Canon EOS R6`, `Holidays`, `IMG_0042.jpg` |
+
+JSON shapes (camelCase):
+
+```ts
+type SessionConfig = {
+  inputFolders: string[];
+  outputFolder: string;
+  pathTemplate: string;
+};
+type Session = {
+  schemaVersion: number;
+  config: SessionConfig;
+  createdAt: string; // RFC 3339 UTC
+  updatedAt: string;
+};
+type SessionSummary = {
+  inputFolders: string[];
+  outputFolder: string;
+  createdAt: string;
+  updatedAt: string;
+};
+type AppError = { code: string; message: string };
+type SessionStatus =
+  | { state: "none" }
+  | { state: "existing"; summary: SessionSummary }
+  | { state: "unreadable"; reason: AppError };
+```
+
+`session_create` validates the configuration, creates the output folder if needed and stores the path template normalised. Error codes:
+
+| Code                                                                                | Meaning                                                                |
+| ----------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `no_input_folders`                                                                  | no input folder                                                        |
+| `path_not_absolute`                                                                 | an input or the output path is relative                                |
+| `input_not_found`, `input_not_a_directory`                                          | an input does not exist, or is a file                                  |
+| `duplicate_input`                                                                   | the same folder twice (links resolved, case-insensitive)               |
+| `nested_inputs`                                                                     | an input is inside another input                                       |
+| `output_inside_input`, `input_inside_output`                                        | the output and an input overlap (an identical folder counts as inside) |
+| `output_not_a_directory`, `output_create_failed`                                    | the output is a file, or cannot be created                             |
+| `session_dir_conflict`                                                              | a folder is, contains or lies inside the application session directory |
+| `session_already_exists`                                                            | `session_create` while a session exists: reset first                   |
+| `no_session`, `session_file_missing`, `session_corrupted`, `session_schema_too_new` | reading problems (also reported by `session_status`)                   |
+| `reset_unsafe`                                                                      | the reset safety checks refused to delete                              |
+| `io`                                                                                | other i/o error                                                        |
+| `template_*`                                                                        | invalid path template, see below                                       |
+
+### Path template
+
+A template is a relative path built from literal text and tokens, for example `{year}/{month}/{camera}/{filename}`. Tokens: `{year}` (4 digits), `{month}` and `{day}` (2 digits), `{camera}` (`unknown-camera` when empty), `{original_folder}` and `{filename}`. Values are sanitised when rendered: characters invalid on Windows and control characters become `_`, trailing dots and spaces are trimmed, and a segment that would be empty or a reserved Windows name is made safe (`_` or a `_` prefix). Each rule has its own error code:
+
+| Code                                                                                     | Rule                                                                                  |
+| ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `template_empty`                                                                         | the template is not empty                                                             |
+| `template_unknown_token`, `template_unbalanced_braces`, `template_nested_braces`         | only the six tokens, with balanced and non-nested braces                              |
+| `template_absolute_path`, `template_drive_letter`, `template_unc_path`                   | relative path: no leading `/` or `\`, no `C:`, no `\\server`                          |
+| `template_dot_segment`, `template_empty_segment`                                         | no `.`, `..` or empty segment (`a//b`, trailing separator); `/` and `\` both accepted |
+| `template_invalid_character`                                                             | no `<>:"\|?*` or control character in literal text                                    |
+| `template_reserved_name`                                                                 | no literal segment named `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`     |
+| `template_invalid_segment_end`                                                           | a literal segment does not end with a dot or a space                                  |
+| `template_missing_filename`, `template_duplicate_filename`, `template_filename_not_last` | `{filename}` appears exactly once, in the last segment (`{year}_{filename}` is fine)  |
+| `template_too_long`                                                                      | rendered with the longest plausible values, the path stays within 240 characters      |
+
+Applying a template to real files is not implemented yet.
+
 ## Continuous integration and releases
 
 GitHub Actions workflows (`.github/workflows/`):
@@ -57,7 +154,7 @@ The release workflow needs a `RELEASE_PLEASE_TOKEN` repository secret (a fine-gr
 ## Project layout
 
 - `src/`: Svelte front end (`routes/` for pages, `lib/` for shared code and its tests).
-- `src-tauri/`: Rust backend (`src/lib.rs` holds the commands, `tauri.conf.json` the app configuration, `capabilities/` the permissions granted to the front end).
+- `src-tauri/`: Rust backend (`src/lib.rs` holds the commands, `src/session/` the session logic, `tauri.conf.json` the app configuration, `capabilities/` the permissions granted to the front end).
 
 ## License
 

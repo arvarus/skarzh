@@ -18,6 +18,11 @@ Rust tools live in the rustup/cargo bin directory; make sure `cargo` is on the P
 
 - `src/`: front end. `routes/` holds the SvelteKit pages, `lib/` the shared TypeScript. Backend calls go through typed wrappers around `invoke` (see `src/lib/app-info.ts`), never raw `invoke` calls in components.
 - `src-tauri/`: backend. `src/lib.rs` defines the Tauri commands and `run()`; `src/main.rs` only calls `skarzh_lib::run()`. Keep logic in plain functions (unit-testable without a Tauri runtime) and keep `#[tauri::command]` functions thin.
+- `src-tauri/src/session/`: the session (one at a time: the user's setup plus everything derived from it). Submodules: `config` (data model, camelCase JSON), `error` (`SessionError`, serialised as `{ code, message }` with stable codes), `paths` (`SessionPaths`: `<app local data>/session/` with `session.json`, `thumbnails/`, `cache/`, plus path comparison helpers), `fsutil` (atomic write, link-safe removal), `validation` (rules checked on create), `store` (`SessionStore`: status, create, get, resume, reset), `template` (path template parser, validator, renderer). The store takes its root directory as a parameter (temp dirs in tests); `lib.rs` injects the real app local data dir in a `Mutex`-guarded `SessionState` built in `setup`.
+  - All data derived from a session (scan results, thumbnails, hashes, review decisions) must live under `SessionPaths::dir()`, so that `session_reset` wipes it.
+  - Session logic never modifies or deletes anything in the input and output folders.
+  - `session.json` is only written through `fsutil::write_atomic`, and an unreadable one (corrupted, newer schema) is never overwritten: it is reset.
+  - Background jobs (scan, thumbnails, hashing) must be cancelled before `session_reset`.
 - `src-tauri/capabilities/`: permissions granted to the webview. Grant only what is used.
 - Tests: Vitest next to the code (`*.test.ts`, mock `@tauri-apps/api/core`); Rust unit tests in `#[cfg(test)]` modules.
 
